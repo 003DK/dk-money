@@ -1,7 +1,7 @@
 import { useMemo, useRef, useState } from 'react'
 import { api, inr } from './api'
 
-export default function Transactions({ rows, month, onEdit, onChanged }) {
+export default function Transactions({ rows, month, onEdit, onRepeat, onChanged }) {
   const [q, setQ] = useState('')
   const [type, setType] = useState('all')
   const [msg, setMsg] = useState('')
@@ -43,9 +43,10 @@ export default function Transactions({ rows, month, onEdit, onChanged }) {
           <div className="dayhead">{new Date(d).toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short' })}</div>
           {list.map((r) => (
             <div className="li" key={r.id}>
-              <div><b>{r.category}</b><small>{r.mode}{r.note ? ' · ' + r.note : ''}</small></div>
-              <div className="right"><b className={r.type}>{r.type === 'debit' ? '-' : '+'}{inr(r.amount)}</b>
-                <span><button className="link" onClick={() => onEdit(r)}>Edit</button><button className="link" onClick={() => del(r)}>Delete</button></span></div>
+              <div><b>{r.category}</b><small>{r.mode}{r.note ? ' · ' + r.note : ''}</small>
+                {r.splits?.length > 0 && <small className="tag">{r.splits.some((x) => x.amount < 0) ? `🤝 paid by ${r.splits[0].friend}` : `🤝 total ${inr(r.amount)} · split with ${r.splits.map((x) => x.friend).join(', ')}`}</small>}</div>
+              <div className="right"><b className={r.type}>{r.type === 'debit' ? '-' : '+'}{inr(r.type === 'debit' ? r.my_share : r.amount)}</b>
+                <span><button className="link" onClick={() => onEdit(r)}>Edit</button><button className="link" onClick={() => onRepeat(r)}>Repeat</button><button className="link" onClick={() => del(r)}>Delete</button></span></div>
             </div>
           ))}
         </div>

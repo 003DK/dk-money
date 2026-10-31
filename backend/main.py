@@ -1,3 +1,4 @@
+import calendar
 import io
 import os
 import time
@@ -10,7 +11,7 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from sqlalchemy import Column, Date as SADate, DateTime, Float, Integer, String, create_engine
+from sqlalchemy import Boolean, Column, Date as SADate, DateTime, Float, Integer, String, UniqueConstraint, create_engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 from analytics import analyze
@@ -37,6 +38,60 @@ class Txn(Base):
     mode = Column(String(40), nullable=False)
     note = Column(String(300), default="")
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Cat(Base):
+    __tablename__ = "categories"
+    __table_args__ = (UniqueConstraint("owner", "type", "name"),)
+    id = Column(Integer, primary_key=True)
+    owner = Column(String(200), index=True, nullable=False)
+    type = Column(String(10), nullable=False)
+    name = Column(String(40), nullable=False)
+
+
+class Budget(Base):
+    __tablename__ = "budgets"
+    __table_args__ = (UniqueConstraint("owner", "category"),)
+    id = Column(Integer, primary_key=True)
+    owner = Column(String(200), index=True, nullable=False)
+    category = Column(String(60), nullable=False)  # "__total__" = overall
+    amount = Column(Float, nullable=False)
+
+
+class Goal(Base):
+    __tablename__ = "goals"
+    id = Column(Integer, primary_key=True)
+    owner = Column(String(200), index=True, nullable=False)
+    name = Column(String(80), nullable=False)
+    target = Column(Float, nullable=False)
+    saved = Column(Float, default=0)
+
+
+class Rec(Base):
+    __tablename__ = "recurring"
+    id = Column(Integer, primary_key=True)
+    owner = Column(String(200), index=True, nullable=False)
+    type = Column(String(10), nullable=False)
+    amount = Column(Float, nullable=False)
+    category = Column(String(60), nullable=False)
+    mode = Column(String(40), nullable=False)
+    note = Column(String(300), default="")
+    day = Column(Integer, nullable=False)
+    start = Column(String(7), nullable=False)       # YYYY-MM
+    last_run = Column(String(7), nullable=True)     # last month generated
+
+
+class Ledger(Base):
+    """Money between you and friends. amount > 0: friend owes you, amount < 0: you owe friend."""
+    __tablename__ = "ledger"
+    id = Column(Integer, primary_key=True)
+    owner = Column(String(200), index=True, nullable=False)
+    friend = Column(String(60), nullable=False)
+    amount = Column(Float, nullable=False)
+    date = Column(SADate, nullable=False)
+    kind = Column(String(10), nullable=False)      # split | settle | manual
+    txn_id = Column(Integer, index=True, nullable=True)
+    note = Column(String(300), default="")
 
 
 Base.metadata.create_all(engine)
@@ -82,7 +137,13 @@ def db():
         s.close()
 
 
+class SplitIn(BaseModel):
+    friend: str = Field(min_length=1, max_length=60)
+    amount: float = Field(gt=-1e10, lt=1e10)   # + friend owes you, - you owe friend
+
+
 class TxnIn(BaseModel):
+    splits: list[SplitIn] = []
     type: Literal["credit", "debit"]
     amount: float = Field(gt=0, lt=1e10)
     date: Date
@@ -91,8 +152,47 @@ class TxnIn(BaseModel):
     note: str = Field("", max_length=300)
 
 
-def out(t: Txn) -> dict:
-    return {"id": t.id, "type": t.type, "amount": t.amount, "date": t.date.isoformat(), "category": t.category, "mode": t.mode, "note": t.note or ""}
+def out(t: Txn, sm: Optional[dict] = None) -> dict:
+    sp = (sm or {}).get(t.id, [])
+    mine = t.amount - sum(x["amount"] for x in sp if x["amount"] > 0) if t.type == "debit" else t.amount
+    return {"id": t.id, "type": t.type, "amount": t.amount, "my_share": round(mine, 2), "splits": sp,
+            "date": t.date.isoformat(), "category": t.category, "mode": t.mode, "note": t.note or ""}
+
+
+def _split_map(s: Session, me: str) -> dict:
+    m: dict = {}
+    for r in s.query(Ledger).filter(Ledger.owner == me, Ledger.kind == "split"):
+        m.setdefault(r.txn_id, []).append({"friend": r.friend, "amount": r.amount})
+    return m
+
+
+def _check_splits(body: "TxnIn"):
+    if not body.splits:
+        return
+    if body.type != "debit":
+        raise HTTPException(400, "Only debit entries can be shared")
+    if any(x.amount == 0 for x in body.splits):
+        raise HTTPException(400, "A friend's share cannot be 0")
+    if sum(x.amount for x in body.splits if x.amount > 0) > body.amount + 0.01:
+        raise HTTPException(400, "Friends' shares are more than the total amount")
+
+
+def _save_splits(s: Session, me: str, t: Txn, splits: list):
+    s.query(Ledger).filter(Ledger.owner == me, Ledger.txn_id == t.id, Ledger.kind == "split").delete()
+    for x in splits:
+        s.add(Ledger(owner=me, friend=x.friend.strip(), amount=x.amount, date=t.date, kind="split", txn_id=t.id, note=""))
+
+
+def _eff_rows(s: Session, me: str) -> list:
+    """Rows for analysis: debits count only YOUR share."""
+    sm = _split_map(s, me)
+    rows = []
+    for t in s.query(Txn).filter(Txn.owner == me).all():
+        r = out(t, sm)
+        if t.type == "debit":
+            r["amount"] = r["my_share"]
+        rows.append(r)
+    return rows
 
 
 @app.get("/health")
@@ -108,14 +208,17 @@ def list_txns(month: Optional[str] = None, me: str = Depends(user), s: Session =
         start = Date(y, m, 1)
         end = Date(y + (m == 12), m % 12 + 1, 1)
         q = q.filter(Txn.date >= start, Txn.date < end)
-    return [out(t) for t in q.order_by(Txn.date.desc(), Txn.id.desc()).all()]
+    sm = _split_map(s, me)
+    return [out(t, sm) for t in q.order_by(Txn.date.desc(), Txn.id.desc()).all()]
 
 
 @app.post("/transactions", status_code=201)
 def add_txn(body: TxnIn, me: str = Depends(user), s: Session = Depends(db)):
-    t = Txn(owner=me, **body.model_dump())
+    _check_splits(body)
+    t = Txn(owner=me, **body.model_dump(exclude={"splits"}))
     s.add(t); s.commit(); s.refresh(t)
-    return out(t)
+    _save_splits(s, me, t, body.splits); s.commit()
+    return out(t, _split_map(s, me))
 
 
 def _get(s: Session, me: str, tid: int) -> Txn:
@@ -127,29 +230,35 @@ def _get(s: Session, me: str, tid: int) -> Txn:
 
 @app.put("/transactions/{tid}")
 def edit_txn(tid: int, body: TxnIn, me: str = Depends(user), s: Session = Depends(db)):
+    _check_splits(body)
     t = _get(s, me, tid)
-    for k, v in body.model_dump().items():
+    for k, v in body.model_dump(exclude={"splits"}).items():
         setattr(t, k, v)
     s.commit(); s.refresh(t)
-    return out(t)
+    _save_splits(s, me, t, body.splits); s.commit()
+    return out(t, _split_map(s, me))
 
 
 @app.delete("/transactions/{tid}")
 def del_txn(tid: int, me: str = Depends(user), s: Session = Depends(db)):
-    s.delete(_get(s, me, tid)); s.commit()
+    s.delete(_get(s, me, tid))
+    s.query(Ledger).filter(Ledger.owner == me, Ledger.txn_id == tid, Ledger.kind == "split").delete()
+    s.commit()
     return {"deleted": tid}
 
 
 @app.get("/analytics")
 def analytics(month: Optional[str] = None, me: str = Depends(user), s: Session = Depends(db)):
-    rows = [out(t) for t in s.query(Txn).filter(Txn.owner == me).all()]
-    return analyze(rows, month)
+    return analyze(_eff_rows(s, me), month, _budgets(s, me))
 
 
 @app.get("/export")
 def export(me: str = Depends(user), s: Session = Depends(db)):
-    rows = [out(t) for t in s.query(Txn).filter(Txn.owner == me).order_by(Txn.date).all()]
-    df = pd.DataFrame(rows, columns=["date", "type", "amount", "category", "mode", "note"])
+    sm = _split_map(s, me)
+    rows = [out(t, sm) for t in s.query(Txn).filter(Txn.owner == me).order_by(Txn.date).all()]
+    for r in rows:
+        r["split_with"] = ", ".join(f"{x['friend']} {x['amount']:g}" for x in r["splits"])
+    df = pd.DataFrame(rows, columns=["date", "type", "amount", "my_share", "category", "mode", "note", "split_with"])
     return Response(df.to_csv(index=False), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=dk-money.csv"})
 
 
@@ -178,3 +287,202 @@ async def import_csv(file: UploadFile = File(...), me: str = Depends(user), s: S
         n += 1
     s.commit()
     return {"imported": n, "skipped": int(len(df) - n)}
+
+
+# ---------- categories, budgets, goals, recurring ----------
+class CatIn(BaseModel):
+    type: Literal["credit", "debit"]
+    name: str = Field(min_length=1, max_length=40)
+
+
+class BudgetIn(BaseModel):
+    category: str = Field(min_length=1, max_length=60)
+    amount: float = Field(ge=0, lt=1e10)
+
+
+class GoalIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    target: float = Field(gt=0, lt=1e10)
+    saved: float = Field(0, ge=0, lt=1e10)
+
+
+class RecIn(BaseModel):
+    type: Literal["credit", "debit"]
+    amount: float = Field(gt=0, lt=1e10)
+    category: str = Field(min_length=1, max_length=60)
+    mode: str = Field(min_length=1, max_length=40)
+    note: str = Field("", max_length=300)
+    day: int = Field(ge=1, le=31)
+
+
+def _budgets(s: Session, me: str) -> dict:
+    return {b.category: b.amount for b in s.query(Budget).filter(Budget.owner == me)}
+
+
+def _owned(s: Session, model, me: str, oid: int):
+    o = s.query(model).filter(model.id == oid, model.owner == me).first()
+    if not o:
+        raise HTTPException(404, "Not found")
+    return o
+
+
+@app.post("/categories", status_code=201)
+def add_cat(body: CatIn, me: str = Depends(user), s: Session = Depends(db)):
+    name = body.name.strip()
+    if not s.query(Cat).filter(Cat.owner == me, Cat.type == body.type, Cat.name == name).first():
+        s.add(Cat(owner=me, type=body.type, name=name)); s.commit()
+    return {"type": body.type, "name": name}
+
+
+@app.put("/categories/{cid}")
+def rename_cat(cid: int, body: dict, me: str = Depends(user), s: Session = Depends(db)):
+    c = _owned(s, Cat, me, cid)
+    name = str(body.get("name", "")).strip()[:40]
+    if not name:
+        raise HTTPException(400, "Name required")
+    if name != c.name and s.query(Cat).filter(Cat.owner == me, Cat.type == c.type, Cat.name == name).first():
+        raise HTTPException(400, "That category already exists")
+    old = c.name
+    s.query(Txn).filter(Txn.owner == me, Txn.type == c.type, Txn.category == old).update({"category": name})
+    s.query(Rec).filter(Rec.owner == me, Rec.type == c.type, Rec.category == old).update({"category": name})
+    if c.type == "debit" and not s.query(Budget).filter(Budget.owner == me, Budget.category == name).first():
+        s.query(Budget).filter(Budget.owner == me, Budget.category == old).update({"category": name})
+    c.name = name
+    s.commit()
+    return {"ok": True}
+
+
+@app.delete("/categories/{cid}")
+def del_cat(cid: int, me: str = Depends(user), s: Session = Depends(db)):
+    s.delete(_owned(s, Cat, me, cid)); s.commit()
+    return {"deleted": cid}
+
+
+@app.put("/budgets")
+def set_budget(body: BudgetIn, me: str = Depends(user), s: Session = Depends(db)):
+    b = s.query(Budget).filter(Budget.owner == me, Budget.category == body.category).first()
+    if body.amount == 0:
+        if b:
+            s.delete(b)
+    elif b:
+        b.amount = body.amount
+    else:
+        s.add(Budget(owner=me, category=body.category, amount=body.amount))
+    s.commit()
+    return {"ok": True}
+
+
+@app.post("/goals", status_code=201)
+def add_goal(body: GoalIn, me: str = Depends(user), s: Session = Depends(db)):
+    g = Goal(owner=me, **body.model_dump()); s.add(g); s.commit()
+    return {"id": g.id}
+
+
+@app.put("/goals/{gid}")
+def edit_goal(gid: int, body: GoalIn, me: str = Depends(user), s: Session = Depends(db)):
+    g = _owned(s, Goal, me, gid)
+    g.name, g.target, g.saved = body.name, body.target, body.saved
+    s.commit()
+    return {"ok": True}
+
+
+@app.delete("/goals/{gid}")
+def del_goal(gid: int, me: str = Depends(user), s: Session = Depends(db)):
+    s.delete(_owned(s, Goal, me, gid)); s.commit()
+    return {"deleted": gid}
+
+
+@app.post("/recurring", status_code=201)
+def add_rec(body: RecIn, me: str = Depends(user), s: Session = Depends(db)):
+    r = Rec(owner=me, start=Date.today().strftime("%Y-%m"), **body.model_dump())
+    s.add(r); s.commit()
+    return {"id": r.id}
+
+
+@app.delete("/recurring/{rid}")
+def del_rec(rid: int, me: str = Depends(user), s: Session = Depends(db)):
+    s.delete(_owned(s, Rec, me, rid)); s.commit()
+    return {"deleted": rid}
+
+
+def run_recurring(s: Session, me: str) -> int:
+    """Create due entries from recurring rules (once per month per rule)."""
+    today, made = Date.today(), 0
+    for r in s.query(Rec).filter(Rec.owner == me).all():
+        y, m = map(int, (r.last_run or r.start).split("-"))
+        if r.last_run:
+            y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+        while (y, m) <= (today.year, today.month):
+            d = Date(y, m, min(r.day, calendar.monthrange(y, m)[1]))
+            if d > today:
+                break
+            s.add(Txn(owner=me, type=r.type, amount=r.amount, date=d, category=r.category, mode=r.mode, note=r.note or f"{r.category} (auto)"))
+            r.last_run, made = f"{y}-{m:02d}", made + 1
+            y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    if made:
+        s.commit()
+    return made
+
+
+@app.get("/bootstrap")
+def bootstrap(month: Optional[str] = None, me: str = Depends(user), s: Session = Depends(db)):
+    """Everything the app needs in ONE request (fast on phone and handles cold start once)."""
+    run_recurring(s, me)
+    sm = _split_map(s, me)
+    rows = [out(t, sm) for t in s.query(Txn).filter(Txn.owner == me).order_by(Txn.date.desc(), Txn.id.desc()).all()]
+    buds = _budgets(s, me)
+    return {
+        "analytics": analyze(_eff_rows(s, me), month, buds),
+        "friends": _friends(s, me),
+        "transactions": rows,
+        "categories": [{"id": c.id, "type": c.type, "name": c.name} for c in s.query(Cat).filter(Cat.owner == me).order_by(Cat.name)],
+        "budgets": [{"category": k, "amount": v} for k, v in buds.items()],
+        "goals": [{"id": g.id, "name": g.name, "target": g.target, "saved": g.saved} for g in s.query(Goal).filter(Goal.owner == me).order_by(Goal.id)],
+        "recurring": [{"id": r.id, "type": r.type, "amount": r.amount, "category": r.category, "mode": r.mode, "note": r.note or "", "day": r.day} for r in s.query(Rec).filter(Rec.owner == me).order_by(Rec.day)],
+    }
+
+
+# ---------- friends (shared expenses) ----------
+class LedgerIn(BaseModel):
+    friend: str = Field(min_length=1, max_length=60)
+    amount: float = Field(gt=-1e10, lt=1e10)  # + friend owes you more, - friend owes you less / you owe friend
+    date: Date
+    kind: Literal["settle", "manual"]
+    note: str = Field("", max_length=300)
+
+
+def _friends(s: Session, me: str) -> list:
+    info = {t.id: (t.category, t.note, t.amount) for t in s.query(Txn).filter(Txn.owner == me)}
+    g: dict = {}
+    for r in s.query(Ledger).filter(Ledger.owner == me).order_by(Ledger.date.desc(), Ledger.id.desc()):
+        f = g.setdefault(r.friend.lower(), {"name": r.friend, "balance": 0.0, "items": []})
+        f["balance"] += r.amount
+        label, total = r.note or "", None
+        if r.kind == "split" and r.txn_id in info:
+            cat, note, total = info[r.txn_id]
+            label = cat + (f" · {note}" if note else "")
+        f["items"].append({"id": r.id, "date": r.date.isoformat(), "amount": r.amount, "kind": r.kind,
+                           "label": label, "total": total, "txn_id": r.txn_id})
+    out_ = []
+    for f in g.values():
+        f["balance"] = 0.0 if abs(f["balance"]) < 0.005 else round(f["balance"], 2)
+        out_.append(f)
+    return sorted(out_, key=lambda f: -abs(f["balance"]))
+
+
+@app.post("/ledger", status_code=201)
+def add_ledger(body: LedgerIn, me: str = Depends(user), s: Session = Depends(db)):
+    if body.amount == 0:
+        raise HTTPException(400, "Amount cannot be 0")
+    s.add(Ledger(owner=me, friend=body.friend.strip(), amount=body.amount, date=body.date, kind=body.kind, note=body.note))
+    s.commit()
+    return {"ok": True}
+
+
+@app.delete("/ledger/{lid}")
+def del_ledger(lid: int, me: str = Depends(user), s: Session = Depends(db)):
+    r = _owned(s, Ledger, me, lid)
+    if r.kind == "split":
+        raise HTTPException(400, "Edit or delete the original entry instead")
+    s.delete(r); s.commit()
+    return {"deleted": lid}
