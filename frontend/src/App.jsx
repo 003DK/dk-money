@@ -100,7 +100,7 @@ export default function App() {
       </header>
       <nav>{TABS.map(([k, ic, t]) => <button key={k} className={tab === k ? 'on' : ''} onClick={() => setTab(k)}><span>{ic}</span>{t}</button>)}</nav>
       <main>
-        {err && <div className="card err">{err.includes('fetch') ? 'Cannot reach the server. It may be waking up (free plan), try again in a minute.' : err}</div>}
+        {err && <div className="card err">{err.includes('fetch') ? 'Cannot reach the server. It may be waking up (free plan), wait a minute and tap ⟳. If it keeps failing, check CORS_ORIGINS on Render (lower case, e.g. https://yourname.github.io).' : err}</div>}
         {loading && !d && <p className="muted pad">Loading… the free server can take ~30 seconds to wake up.</p>}
         {a?.empty && tab !== 'plan' && tab !== 'fr' && <div className="card"><Empty text="No entries yet. Tap + to add your first one." /></div>}
         {a && !a.empty && tab === 'dash' && <Dashboard a={a} owed={owed} />}

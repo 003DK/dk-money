@@ -23,11 +23,14 @@ def _group(d: pd.DataFrame, col: str):
     if d.empty:
         return []
     g = d.groupby(col).amount.sum().sort_values(ascending=False)
+    g = g[g > 0]
     total = g.sum()
+    if not total:
+        return []
     return [{"name": k, "amount": round(float(v), 2), "pct": round(float(v / total * 100), 1)} for k, v in g.items()]
 
 
-def analyze(rows: list[dict], month: str | None = None) -> dict:
+def analyze(rows: list[dict], month: str | None = None, budgets: dict | None = None) -> dict:
     today = date.today()
     cur_ym = today.strftime("%Y-%m")
     if not rows:
@@ -106,8 +109,28 @@ def analyze(rows: list[dict], month: str | None = None) -> dict:
     by_cat = _group(exp, "category")
     by_mode = _group(exp, "mode")
 
+    # budgets: category -> monthly limit ("__total__" = overall)
+    bud, safe = [], None
+    for cat, lim in (budgets or {}).items():
+        spent = expense if cat == "__total__" else float(c_now.get(cat, 0))
+        pct = spent / lim * 100 if lim else 0
+        bud.append({"category": cat, "limit": lim, "spent": round(spent, 2), "pct": round(pct, 1),
+                    "status": "over" if pct >= 100 else "warn" if pct >= 80 else "ok"})
+    bud.sort(key=lambda b: (b["category"] != "__total__", -b["pct"]))
+    if budgets and "__total__" in budgets and month == cur_ym:
+        safe = max(budgets["__total__"] - expense, 0) / (dim - today.day + 1)
+    no_spend = sum(1 for d in daily[:elapsed] if d["debit"] == 0)
+
     # plain-language insights
     ins = []
+    for b in bud:
+        nm = "Overall" if b["category"] == "__total__" else b["category"]
+        if b["status"] == "over":
+            ins.append(f"🚨 {nm} budget exceeded: {inr(b['spent'])} of {inr(b['limit'])}.")
+        elif b["status"] == "warn":
+            ins.append(f"⚠️ {nm} budget is {b['pct']:.0f}% used ({inr(b['spent'])} of {inr(b['limit'])}).")
+    if safe is not None:
+        ins.append(f"You can spend about {inr(safe)} per day for the rest of the month and stay within your overall budget.")
     if expense > 0 and by_cat:
         ins.append(f"{by_cat[0]['name']} is your biggest spend: {inr(by_cat[0]['amount'])} ({by_cat[0]['pct']}% of expenses).")
     if income > 0:
@@ -116,7 +139,7 @@ def analyze(rows: list[dict], month: str | None = None) -> dict:
     if prev_total > 0 and expense > 0:
         ch = (expense - prev_total) / prev_total * 100
         ins.append(f"Spending is {abs(ch):.0f}% {'higher' if ch > 0 else 'lower'} than last month ({inr(prev_total)}).")
-    if projected:
+    if projected and not safe:
         ins.append(f"At this pace you will spend about {inr(projected)} by month end.")
     if expense > 0:
         wend = float(wk[5] + wk[6])
@@ -128,6 +151,8 @@ def analyze(rows: list[dict], month: str | None = None) -> dict:
         cash = next((x for x in by_mode if x["name"].lower() == "cash"), None)
         if cash and cash["pct"] > 30:
             ins.append(f"{cash['pct']}% of spend is in cash, which is hard to track. Note it down as you go.")
+    if no_spend >= 3:
+        ins.append(f"{no_spend} no-spend days so far this month. Nice.")
     if anomalies:
         ins.append(f"{len(anomalies)} unusually large expense(s) compared to your normal for that category.")
 
@@ -135,8 +160,9 @@ def analyze(rows: list[dict], month: str | None = None) -> dict:
         "empty": False, "month": month, "months": months,
         "summary": {"income": round(income, 2), "expense": round(expense, 2), "net": round(income - expense, 2),
                     "savings_rate": round((income - expense) / income * 100, 1) if income else None,
-                    "count": int(len(cur)), "avg_daily": round(avg_daily, 2),
+                    "count": int(len(cur)), "avg_daily": round(avg_daily, 2), "no_spend_days": no_spend,
                     "projected": round(projected, 2) if projected else None, "prev_expense": round(prev_total, 2)},
+        "safe_per_day": round(safe, 2) if safe is not None else None, "budgets": bud,
         "by_category": by_cat, "by_mode": by_mode, "income_by_category": _group(inc, "category"),
         "daily": daily, "weekday": weekday, "trend": trend, "mom": mom[:8],
         "top_expenses": top, "anomalies": anomalies[:6], "recurring": rec[:6], "insights": ins,

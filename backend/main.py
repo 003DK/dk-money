@@ -4,12 +4,14 @@ import os
 import time
 from datetime import date as Date, datetime
 from typing import Literal, Optional
+from urllib.parse import urlparse
+import traceback
 
 import httpx
 import pandas as pd
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import Boolean, Column, Date as SADate, DateTime, Float, Integer, String, UniqueConstraint, create_engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
@@ -97,9 +99,29 @@ class Ledger(Base):
 Base.metadata.create_all(engine)
 
 app = FastAPI(title="DK Money API")
+
+
+@app.middleware("http")
+async def show_errors(request, call_next):
+    """Turn crashes into a readable JSON error (keeps CORS headers, so the browser shows the real message)."""
+    try:
+        return await call_next(request)
+    except Exception as e:  # noqa
+        traceback.print_exc()
+        return JSONResponse({"detail": f"Server error: {type(e).__name__}: {e}"}, status_code=500)
+
+
+def _origin(o: str) -> str:
+    """Normalise: lower-case, no trailing slash, no path (browsers send https://name.github.io in lower case)."""
+    o = o.strip().lower()
+    p = urlparse(o)
+    return f"{p.scheme}://{p.netloc}" if p.scheme and p.netloc else o.rstrip("/")
+
+
+# added last = outermost, so CORS headers are on every response, including errors
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if o.strip()],
+    allow_origins=[_origin(o) for o in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if o.strip()],
     allow_methods=["*"], allow_headers=["*"],
 )
 
@@ -116,16 +138,20 @@ def user(authorization: Optional[str] = Header(None)) -> str:
     if hit and hit[1] > time.time():
         email = hit[0]
     else:
+        if not SUPABASE_URL.startswith("http"):
+            raise HTTPException(500, "SUPABASE_URL on Render is missing or wrong (must start with https://)")
+        if not SUPABASE_ANON_KEY:
+            raise HTTPException(500, "SUPABASE_ANON_KEY on Render is missing")
         try:
-            r = httpx.get(f"{SUPABASE_URL}/auth/v1/user", headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_ANON_KEY}, timeout=10)
-        except httpx.HTTPError:
-            raise HTTPException(503, "Auth service unreachable")
+            r = httpx.get(f"{SUPABASE_URL}/auth/v1/user", headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_ANON_KEY}, timeout=15)
+        except Exception as e:  # any network / URL problem
+            raise HTTPException(503, f"Cannot reach Supabase auth: {type(e).__name__}. Check SUPABASE_URL on Render.")
         if r.status_code != 200:
-            raise HTTPException(401, "Invalid or expired session")
+            raise HTTPException(401, f"Supabase rejected the login (status {r.status_code}). Sign out and sign in again; if it repeats, check SUPABASE_ANON_KEY on Render.")
         email = (r.json().get("email") or "").lower()
         _cache[token] = (email, time.time() + 300)
     if not ALLOWED or email not in ALLOWED:
-        raise HTTPException(403, "This email is not allowed")
+        raise HTTPException(403, f"Email '{email}' is not in ALLOWED_EMAILS on Render" if ALLOWED else "ALLOWED_EMAILS is not set on Render")
     return email
 
 
@@ -154,7 +180,7 @@ class TxnIn(BaseModel):
 
 def out(t: Txn, sm: Optional[dict] = None) -> dict:
     sp = (sm or {}).get(t.id, [])
-    mine = t.amount - sum(x["amount"] for x in sp if x["amount"] > 0) if t.type == "debit" else t.amount
+    mine = max(t.amount - sum(x["amount"] for x in sp if x["amount"] > 0), 0) if t.type == "debit" else t.amount
     return {"id": t.id, "type": t.type, "amount": t.amount, "my_share": round(mine, 2), "splits": sp,
             "date": t.date.isoformat(), "category": t.category, "mode": t.mode, "note": t.note or ""}
 
@@ -249,7 +275,7 @@ def del_txn(tid: int, me: str = Depends(user), s: Session = Depends(db)):
 
 @app.get("/analytics")
 def analytics(month: Optional[str] = None, me: str = Depends(user), s: Session = Depends(db)):
-    return analyze(_eff_rows(s, me), month, _budgets(s, me))
+    return _clean(analyze(_eff_rows(s, me), month, _budgets(s, me)))
 
 
 @app.get("/export")
@@ -313,6 +339,17 @@ class RecIn(BaseModel):
     mode: str = Field(min_length=1, max_length=40)
     note: str = Field("", max_length=300)
     day: int = Field(ge=1, le=31)
+
+
+def _clean(o):
+    """Replace NaN / infinity (not valid JSON) with None, recursively."""
+    if isinstance(o, float):
+        return o if o == o and o not in (float("inf"), float("-inf")) else None
+    if isinstance(o, dict):
+        return {k: _clean(v) for k, v in o.items()}
+    if isinstance(o, list):
+        return [_clean(v) for v in o]
+    return o
 
 
 def _budgets(s: Session, me: str) -> dict:
@@ -432,7 +469,7 @@ def bootstrap(month: Optional[str] = None, me: str = Depends(user), s: Session =
     rows = [out(t, sm) for t in s.query(Txn).filter(Txn.owner == me).order_by(Txn.date.desc(), Txn.id.desc()).all()]
     buds = _budgets(s, me)
     return {
-        "analytics": analyze(_eff_rows(s, me), month, buds),
+        "analytics": _clean(analyze(_eff_rows(s, me), month, buds)),
         "friends": _friends(s, me),
         "transactions": rows,
         "categories": [{"id": c.id, "type": c.type, "name": c.name} for c in s.query(Cat).filter(Cat.owner == me).order_by(Cat.name)],
